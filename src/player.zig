@@ -18,7 +18,7 @@ const Artist = struct {
 
 pub fn createPlaylist(name: []const u8) Playlist {
     return Playlist{
-        .songs = [_]Song{Song{ .artist = 0, .duration = 0, .timestamp = 0 }} ** 250,
+        .songs = [_]Song{Song{ .artist = 0, .duration = 0, .timestamp = 0 }} * *250,
         .latest = 0,
         .name = name,
         .artist_id = null,
@@ -27,7 +27,7 @@ pub fn createPlaylist(name: []const u8) Playlist {
 
 pub fn createAlbum(artist_id: u8, name: []const u8) Playlist {
     return Playlist{
-        .songs = [_]Song{Song{ .artist = 0, .duration = 0, .timestamp = 0 }} ** 250,
+        .songs = [_]Song{Song{ .artist = 0, .duration = 0, .timestamp = 0 }} * *250,
         .latest = 0,
         .name = name,
         .artist_id = artist_id,
