@@ -1,2 +1,5 @@
 # object files
 *.o
+# zig build outputs
+zig-out/
+.zig-cache/
