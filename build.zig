@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/player.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "mp3", .module = mp3 }},
     });
     // Audio output goes through the default-output AudioUnit (see coreaudio.zig).
     if (target.result.os.tag == .macos) player.linkFramework("AudioToolbox", .{});

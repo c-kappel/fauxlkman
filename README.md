@@ -8,13 +8,19 @@ A music player in Zig
 ./zig-out/bin/fauxlkman play song1.mp3 song2.mp3 ...
 ```
 
-Each song is decoded fully into memory (interleaved 16-bit PCM, ~10 MB per stereo minute at 44.1 kHz) before it starts. Playback then only moves a read position, so rewinding and seeking take effect within one audio buffer, with no decoder state to rebuild.
+Each song is decoded into memory as interleaved 16-bit PCM (~10 MB per stereo minute at 44.1 kHz). Playback only moves a read position, so rewinding and seeking take effect within one audio buffer, with no decoder state to rebuild.
 
-- `src/playback.zig`: `Engine` owns the PCM and the play position. Its `render` runs on the audio thread (no allocation or locks). `seek`/`skip`/`rewind`/`togglePause` can be called from any thread and talk to it through atomics. Seeks crossfade and pause/resume ramp over 256 frames to avoid clicks.
+Decoding runs in the background:
+
+1. `mp3.scan` walks the frame headers without decoding them to get the format and the exact trimmed length, so the song's buffer is allocated once, up front.
+2. A thread (`player.Decoding`) fills that buffer with `mp3.decodeInto`, publishing the number of ready frames after each MP3 frame. Playback starts as soon as the first frames are in (about 50 ms after launch). If you seek past what's decoded, playback holds in silence until the decoder catches up.
+3. While a song plays, the next one is decoded too and queued in the engine. When the current song ends, the audio thread switches to it in the middle of the same buffer, so there's no gap. A song with a different sample rate or channel count reopens the output instead.
+
+- `src/playback.zig`: `Track` (a song's buffer plus a count of ready frames) and `Engine`. `Engine.render` runs on the audio thread (no allocation or locks). `load`/`enqueue`/`seek`/`rewind`/`togglePause` can be called from any thread and talk to it through atomics. Seeks crossfade and pause/resume ramp over 256 frames to avoid clicks. A track is freed only after two more render calls finish (`renderCount`), once the audio thread can no longer be reading it.
 - `src/coreaudio.zig`: macOS output through the default-output AudioUnit (AudioToolbox). The unit pulls f32 frames from the engine at the song's sample rate.
-- `src/player.zig`: `Song`/`Playlist` model. `play` queues its arguments as a playlist and moves to the next track when a song ends.
+- `src/player.zig`: `Song`/`Playlist` model and the background `Decoding`. `play` queues its arguments as a playlist.
 
-Controls: `space` pause, `←`/`→` ±5 s, `[`/`]` ±30 s, `0`–`9` jump to 0–90%, `r` restart, `p`/`n` previous/next, `q` quit.
+Controls: `space` pause, `←`/`→` ±5 s, `[`/`]` ±30 s, `0`–`9` jump to 0–90%, `r` restart, `p` previous (or restart if more than 3 s in), `n` next, `q` quit.
 
 ### Downloader
 

@@ -25,18 +25,31 @@ pub const DecodeError = error{NoAudio} || std.mem.Allocator.Error;
 
 /// Decodes a complete MP3 file into interleaved 16-bit PCM.
 pub fn decode(gpa: std.mem.Allocator, data: []const u8) DecodeError!Pcm {
-    const dec = try gpa.create(Decoder);
-    defer gpa.destroy(dec);
-    dec.* = .{};
+    const layout = try scan(data);
+    const samples = try gpa.alloc(i16, layout.frames * layout.channels);
+    var decoded: std.atomic.Value(usize) = .init(0);
+    decodeInto(data, layout, samples, &decoded, null);
+    return .{ .samples = samples, .channels = layout.channels, .sample_rate = layout.sample_rate };
+}
 
-    var samples: std.ArrayList(i16) = .empty;
-    errdefer samples.deinit(gpa);
+/// The shape of a stream's decoded PCM, known before decoding it.
+pub const Layout = struct {
+    channels: u8,
+    sample_rate: u32,
+    /// Frames (samples per channel) after gapless trimming.
+    frames: usize,
+    /// Leading decoded frames dropped by gapless trimming.
+    skip: usize,
+};
 
+/// Walks the frame headers (without decoding) to find the format and exact
+/// length of the decoded audio, so a buffer can be allocated up front.
+pub fn scan(data: []const u8) DecodeError!Layout {
     var it: stream.FrameIterator = .init(data);
     var gapless: ?stream.Gapless = null;
     var format: ?struct { channels: u8, sample_rate: u32 } = null;
+    var total: usize = 0;
     var first = true;
-    var buf: [@import("decoder.zig").max_samples_per_frame * 2]i16 = undefined;
 
     while (it.next()) |f| {
         if (first) {
@@ -46,27 +59,74 @@ pub fn decode(gpa: std.mem.Allocator, data: []const u8) DecodeError!Pcm {
                 continue;
             }
         }
-        const info = dec.decodeFrame(f.bytes, &buf) catch continue;
+        const h = f.header;
         if (format) |fmt| {
             // Mid-stream format changes are not supported; skip such frames.
-            if (fmt.channels != info.channels or fmt.sample_rate != info.sample_rate) continue;
+            if (fmt.channels != h.channels() or fmt.sample_rate != h.sampleRate()) continue;
         } else {
-            format = .{ .channels = info.channels, .sample_rate = info.sample_rate };
+            format = .{ .channels = h.channels(), .sample_rate = h.sampleRate() };
         }
-        try samples.appendSlice(gpa, buf[0 .. info.samples * info.channels]);
+        total += h.samplesPerFrame();
     }
 
     const fmt = format orelse return error.NoAudio;
-    var pcm_slice = try samples.toOwnedSlice(gpa);
-
+    var layout: Layout = .{ .channels = fmt.channels, .sample_rate = fmt.sample_rate, .frames = total, .skip = 0 };
     if (gapless) |g| {
-        const total = pcm_slice.len / fmt.channels;
-        const skip = @min(total, g.delay + decoder_delay);
-        const keep = @min(total - skip, (total -| g.delay) -| g.padding);
-        std.mem.copyForwards(i16, pcm_slice, pcm_slice[skip * fmt.channels ..][0 .. keep * fmt.channels]);
-        pcm_slice = try gpa.realloc(pcm_slice, keep * fmt.channels);
+        layout.skip = @min(total, g.delay + decoder_delay);
+        layout.frames = @min(total - layout.skip, (total -| g.delay) -| g.padding);
     }
-    return .{ .samples = pcm_slice, .channels = fmt.channels, .sample_rate = fmt.sample_rate };
+    return layout;
+}
+
+/// Decodes `data` into `out` (`layout.frames * layout.channels` samples, as
+/// returned by `scan`). After each MP3 frame, the number of output frames
+/// written so far is stored to `decoded` with release ordering, so another
+/// thread can play the beginning while the rest is still being decoded.
+/// Frames that fail to decode become silence. Stops early, leaving the rest
+/// of `out` unwritten, if `cancel` becomes true.
+pub fn decodeInto(
+    data: []const u8,
+    layout: Layout,
+    out: []i16,
+    decoded: *std.atomic.Value(usize),
+    cancel: ?*const std.atomic.Value(bool),
+) void {
+    const ch = layout.channels;
+    std.debug.assert(out.len == layout.frames * ch);
+
+    var dec: Decoder = .{};
+    var buf: [@import("decoder.zig").max_samples_per_frame * 2]i16 = undefined;
+    var it: stream.FrameIterator = .init(data);
+    var first = true;
+    // Position in the untrimmed decoded stream, and frames written to `out`.
+    var stream_pos: usize = 0;
+    var written: usize = 0;
+
+    while (it.next()) |f| {
+        if (written >= layout.frames) break;
+        if (cancel) |c| if (c.load(.monotonic)) return;
+        if (first) {
+            first = false;
+            if (stream.parseInfoTag(f) != null) continue;
+        }
+        const h = f.header;
+        if (h.channels() != ch or h.sampleRate() != layout.sample_rate) continue;
+        const n = h.samplesPerFrame();
+        const pcm = buf[0 .. n * ch];
+        if (dec.decodeFrame(f.bytes, &buf)) |_| {} else |_| @memset(pcm, 0);
+
+        // Copy the part of this frame that falls inside the trimmed range.
+        const from = @max(stream_pos, layout.skip + written) - stream_pos;
+        stream_pos += n;
+        if (from >= n) continue;
+        const count = @min(n - from, layout.frames - written);
+        @memcpy(out[written * ch ..][0 .. count * ch], pcm[from * ch ..][0 .. count * ch]);
+        written += count;
+        decoded.store(written, .release);
+    }
+    // Pad if the stream ended short of what `scan` promised (e.g. a truncated file).
+    @memset(out[written * ch ..], 0);
+    decoded.store(layout.frames, .release);
 }
 
 test {

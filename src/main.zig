@@ -80,52 +80,186 @@ pub fn main(init: std.process.Init) !void {
     } else return fail(usage, .{});
 }
 
-const Action = enum { prev, next, quit };
+const Action = enum { prev, next, quit, advanced, finished };
 
-/// Plays the playlist in order. Each song is decoded fully into memory before
-/// it starts, so seeking within it is instant.
+/// Plays the playlist in order. Each song is decoded on a background thread
+/// into a buffer that holds the whole song, so playback starts right away and
+/// seeking within it is instant. The next song is decoded while the current
+/// one plays and follows it without a gap.
 fn play(gpa: std.mem.Allocator, io: Io, playlist: *const player.Playlist) !void {
-    const tracks = playlist.tracks();
     const term: ?Terminal = Terminal.enterRaw() catch null;
     defer if (term) |t| t.restore();
     if (term != null) std.debug.print(controls, .{});
 
-    var index: usize = 0;
-    while (index < tracks.len) {
-        const song = tracks[index];
-        const data = Io.Dir.cwd().readFileAlloc(io, song.path, gpa, .limited(max_file_size)) catch |err| {
-            std.debug.print("skipping {s}: {t}\n", .{ song.path, err });
-            index += 1;
-            continue;
-        };
-        const decoded = mp3.decode(gpa, data);
-        gpa.free(data);
-        const pcm = decoded catch |err| {
-            std.debug.print("skipping {s}: {t}\n", .{ song.path, err });
-            index += 1;
-            continue;
-        };
-        defer gpa.free(pcm.samples);
-
-        var engine: player.playback.Engine = .init(pcm.samples, pcm.channels, pcm.sample_rate);
-        const output = player.coreaudio.Output.start(&engine) catch |err| return fail("audio output failed: {t}\n", .{err});
-        defer output.deinit();
-        engine.play();
-
-        const action = try control(io, &engine, term != null, song.path, index, tracks.len);
-        std.debug.print("\n", .{});
-        switch (action) {
-            .next => index += 1,
-            .prev => index -|= 1,
-            .quit => break,
-        }
-    }
+    var session: Session = .{ .gpa = gpa, .io = io, .songs = playlist.tracks() };
+    defer session.deinit();
+    try session.run(term != null);
 }
 
-/// Handles key presses and redraws the status line until the song ends or the
-/// user moves to another song.
+/// A playlist entry whose file has been read and is being decoded.
+const Loaded = struct {
+    index: usize,
+    data: []u8,
+    decoding: *player.Decoding,
+
+    fn track(l: Loaded) *player.playback.Track {
+        return &l.decoding.track;
+    }
+
+    fn deinit(l: Loaded, gpa: std.mem.Allocator) void {
+        l.decoding.deinit(gpa);
+        gpa.free(l.data);
+    }
+};
+
+const Session = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    songs: []const player.Song,
+    current: ?Loaded = null,
+    /// The song after `current`, queued in the engine when the formats match.
+    next: ?Loaded = null,
+    /// Whether loading the song after `current` has been attempted.
+    prefetched: bool = false,
+    engine: player.playback.Engine = undefined,
+    output: ?player.coreaudio.Output = null,
+
+    fn deinit(s: *Session) void {
+        s.stopOutput();
+        s.release();
+    }
+
+    fn run(s: *Session, interactive: bool) !void {
+        s.current = s.load(0, .forward) orelse return;
+        while (true) {
+            if (s.output == null) try s.startOutput();
+            s.prefetch();
+            const cur = s.current.?;
+            const action = try control(s.io, &s.engine, interactive, s.songs[cur.index].path, cur.index, s.songs.len);
+            std.debug.print("\n", .{});
+            switch (action) {
+                .advanced => {
+                    // The engine continued into the queued song by itself.
+                    s.quiesce();
+                    cur.deinit(s.gpa);
+                    s.current = s.next;
+                    s.next = null;
+                    s.prefetched = false;
+                },
+                .finished, .next => {
+                    // Reaching the end without advancing means the next song
+                    // (if any) needs the output reopened in another format.
+                    const n = s.next orelse return;
+                    s.next = null;
+                    s.switchTo(n);
+                },
+                .prev => {
+                    if (cur.index == 0 or s.engine.positionSeconds() > 3) {
+                        s.engine.seek(0);
+                        continue;
+                    }
+                    const p = s.load(cur.index - 1, .backward) orelse {
+                        s.engine.seek(0);
+                        continue;
+                    };
+                    s.switchTo(p);
+                },
+                .quit => return,
+            }
+        }
+    }
+
+    /// Makes `l` the current song, freeing the previous current and next
+    /// songs. Switches in place when the format allows; otherwise the output
+    /// is reopened on the next loop iteration.
+    fn switchTo(s: *Session, l: Loaded) void {
+        if (s.output != null and s.engine.accepts(l.track())) {
+            s.engine.enqueue(null);
+            s.engine.load(l.track());
+            s.engine.play();
+            s.quiesce();
+        } else s.stopOutput();
+        s.release();
+        s.current = l;
+    }
+
+    /// Starts decoding the song after the current one and queues it for
+    /// gapless playback.
+    fn prefetch(s: *Session) void {
+        if (s.prefetched) return;
+        s.prefetched = true;
+        s.next = s.load(s.current.?.index + 1, .forward);
+        if (s.next) |n| if (s.engine.accepts(n.track())) s.engine.enqueue(n.track());
+    }
+
+    const Direction = enum { forward, backward };
+
+    /// Starts decoding the first playable song from `from`, moving in `dir`
+    /// past songs that can't be read.
+    fn load(s: *Session, from: usize, dir: Direction) ?Loaded {
+        var i = from;
+        while (i < s.songs.len) {
+            if (s.open(i)) |l| return l else |err| {
+                std.debug.print("\r\x1b[2Kskipping {s}: {t}\n", .{ s.songs[i].path, err });
+            }
+            if (dir == .backward) {
+                if (i == 0) return null;
+                i -= 1;
+            } else i += 1;
+        }
+        return null;
+    }
+
+    fn open(s: *Session, i: usize) !Loaded {
+        const data = try Io.Dir.cwd().readFileAlloc(s.io, s.songs[i].path, s.gpa, .limited(max_file_size));
+        errdefer s.gpa.free(data);
+        return .{ .index = i, .data = data, .decoding = try player.Decoding.start(s.gpa, data) };
+    }
+
+    fn startOutput(s: *Session) !void {
+        const t = s.current.?.track();
+        s.engine = .init(t.channels, t.sample_rate);
+        s.engine.load(t);
+        s.engine.play();
+        s.output = player.coreaudio.Output.start(&s.engine) catch |err| return fail("audio output failed: {t}\n", .{err});
+    }
+
+    fn stopOutput(s: *Session) void {
+        if (s.output) |o| o.deinit();
+        s.output = null;
+    }
+
+    /// Waits for two complete render calls, after which the audio thread no
+    /// longer touches tracks dropped from the engine before this call. Closes
+    /// the output instead if the device stops calling back.
+    fn quiesce(s: *Session) void {
+        const start = s.engine.renderCount();
+        var waited: usize = 0;
+        while (s.engine.renderCount() < start + 2) : (waited += 1) {
+            if (waited >= 500) return s.stopOutput();
+            s.io.sleep(.fromMilliseconds(1), .awake) catch return s.stopOutput();
+        }
+    }
+
+    /// Frees the current and next songs. They must no longer be referenced
+    /// by a running output.
+    fn release(s: *Session) void {
+        if (s.current) |l| l.deinit(s.gpa);
+        if (s.next) |l| l.deinit(s.gpa);
+        s.current = null;
+        s.next = null;
+        s.prefetched = false;
+    }
+};
+
+/// Handles key presses and redraws the status line until the song ends, the
+/// engine moves on to the queued song, or the user picks another song.
 fn control(io: Io, engine: *player.playback.Engine, interactive: bool, name: []const u8, index: usize, count: usize) !Action {
-    while (!engine.isFinished()) {
+    const track = engine.currentTrack();
+    while (true) {
+        if (engine.currentTrack() != track) return .advanced;
+        if (engine.isFinished()) return .finished;
+        const buffered = engine.bufferedFraction();
         std.debug.print("\r\x1b[2K{s} [{d}/{d}] {s}  {f} / {f}", .{
             if (engine.isPlaying()) "▶" else "⏸",
             index + 1,
@@ -134,6 +268,7 @@ fn control(io: Io, engine: *player.playback.Engine, interactive: bool, name: []c
             Clock{ .seconds = engine.positionSeconds() },
             Clock{ .seconds = engine.durationSeconds() },
         });
+        if (buffered < 1) std.debug.print("  decoding {d:.0}%", .{buffered * 100});
 
         if (!interactive) {
             try io.sleep(.fromMilliseconds(100), .awake);
@@ -159,7 +294,6 @@ fn control(io: Io, engine: *player.playback.Engine, interactive: bool, name: []c
             else => {},
         };
     }
-    return .next;
 }
 
 const Clock = struct {
