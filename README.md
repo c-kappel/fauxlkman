@@ -17,6 +17,7 @@ Decoding runs in the background:
 3. While a song plays, the next one is decoded too and queued in the engine. When the current song ends, the audio thread switches to it in the middle of the same buffer, so there's no gap. A song with a different sample rate or channel count reopens the output instead.
 
 - `src/playback.zig`: `Track` (a song's buffer plus a count of ready frames) and `Engine`. `Engine.render` runs on the audio thread (no allocation or locks). `load`/`enqueue`/`seek`/`rewind`/`togglePause` can be called from any thread and talk to it through atomics. Seeks crossfade and pause/resume ramp over 256 frames to avoid clicks. A track is freed only after two more render calls finish (`renderCount`), once the audio thread can no longer be reading it.
+- `src/mp3/id3.zig`: reads title, artist, album artist, album, year and track from ID3v2.2/2.3/2.4 tags. It handles Latin-1, UTF-16 and UTF-8 text and unsynchronisation, and falls back to ID3v1 field by field. Control characters are replaced, so tag text can't inject terminal escape codes. The status line shows `Artist – Title · Album` (or the file name if there's no title), shortened to fit the terminal width. `fauxlkman info` also prints the tags.
 - `src/coreaudio.zig`: macOS output through the default-output AudioUnit (AudioToolbox). The unit pulls f32 frames from the engine at the song's sample rate.
 - `src/player.zig`: `Song`/`Playlist` model and the background `Decoding`. `play` queues its arguments as a playlist.
 

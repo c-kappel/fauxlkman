@@ -70,6 +70,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{t} layer III, {d} Hz, {t}, {d} kbit/s (first frame), {d} frames, {d:.2}s\n", .{
             h.version, h.sampleRate(), h.mode, h.bitrateKbps(), frames, secs,
         });
+        const tags = try mp3.id3.read(arena, data);
+        const fields = [_]struct { []const u8, ?[]const u8 }{
+            .{ "title", tags.title },               .{ "artist", tags.artist },
+            .{ "album artist", tags.album_artist }, .{ "album", tags.album },
+            .{ "year", tags.year },                 .{ "track", tags.track },
+        };
+        for (fields) |f| if (f[1]) |v| std.debug.print("{s}: {s}\n", .{ f[0], v });
     } else if (std.mem.eql(u8, cmd, "play")) {
         var playlist = player.createPlaylist("queue");
         for (args[2..]) |path| {
@@ -100,6 +107,7 @@ fn play(gpa: std.mem.Allocator, io: Io, playlist: *const player.Playlist) !void 
 const Loaded = struct {
     index: usize,
     data: []u8,
+    tags: mp3.id3.Tags,
     decoding: *player.Decoding,
 
     fn track(l: Loaded) *player.playback.Track {
@@ -108,6 +116,7 @@ const Loaded = struct {
 
     fn deinit(l: Loaded, gpa: std.mem.Allocator) void {
         l.decoding.deinit(gpa);
+        l.tags.deinit(gpa);
         gpa.free(l.data);
     }
 };
@@ -135,7 +144,9 @@ const Session = struct {
             if (s.output == null) try s.startOutput();
             s.prefetch();
             const cur = s.current.?;
-            const action = try control(s.io, &s.engine, interactive, s.songs[cur.index].path, cur.index, s.songs.len);
+            var label_buf: [512]u8 = undefined;
+            const label = songLabel(&label_buf, cur.tags, s.songs[cur.index].path);
+            const action = try control(s.io, &s.engine, interactive, label, cur.index, s.songs.len);
             std.debug.print("\n", .{});
             switch (action) {
                 .advanced => {
@@ -213,7 +224,9 @@ const Session = struct {
     fn open(s: *Session, i: usize) !Loaded {
         const data = try Io.Dir.cwd().readFileAlloc(s.io, s.songs[i].path, s.gpa, .limited(max_file_size));
         errdefer s.gpa.free(data);
-        return .{ .index = i, .data = data, .decoding = try player.Decoding.start(s.gpa, data) };
+        const tags = try mp3.id3.read(s.gpa, data);
+        errdefer tags.deinit(s.gpa);
+        return .{ .index = i, .data = data, .tags = tags, .decoding = try player.Decoding.start(s.gpa, data) };
     }
 
     fn startOutput(s: *Session) !void {
@@ -254,21 +267,12 @@ const Session = struct {
 
 /// Handles key presses and redraws the status line until the song ends, the
 /// engine moves on to the queued song, or the user picks another song.
-fn control(io: Io, engine: *player.playback.Engine, interactive: bool, name: []const u8, index: usize, count: usize) !Action {
+fn control(io: Io, engine: *player.playback.Engine, interactive: bool, label: []const u8, index: usize, count: usize) !Action {
     const track = engine.currentTrack();
     while (true) {
         if (engine.currentTrack() != track) return .advanced;
         if (engine.isFinished()) return .finished;
-        const buffered = engine.bufferedFraction();
-        std.debug.print("\r\x1b[2K{s} [{d}/{d}] {s}  {f} / {f}", .{
-            if (engine.isPlaying()) "▶" else "⏸",
-            index + 1,
-            count,
-            std.fs.path.basename(name),
-            Clock{ .seconds = engine.positionSeconds() },
-            Clock{ .seconds = engine.durationSeconds() },
-        });
-        if (buffered < 1) std.debug.print("  decoding {d:.0}%", .{buffered * 100});
+        drawStatus(engine, label, index, count);
 
         if (!interactive) {
             try io.sleep(.fromMilliseconds(100), .awake);
@@ -294,6 +298,116 @@ fn control(io: Io, engine: *player.playback.Engine, interactive: bool, name: []c
             else => {},
         };
     }
+}
+
+/// Redraws the status line, shortening the song label so the line never
+/// wraps (a wrapped line can't be redrawn in place with `\r`).
+fn drawStatus(engine: *const player.playback.Engine, label: []const u8, index: usize, count: usize) void {
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{s} [{d}/{d}] ", .{
+        if (engine.isPlaying()) "▶" else "⏸", index + 1, count,
+    }) catch "";
+    var suffix_buf: [64]u8 = undefined;
+    var suffix_w: Io.Writer = .fixed(&suffix_buf);
+    suffix_w.print("  {f} / {f}", .{
+        Clock{ .seconds = engine.positionSeconds() },
+        Clock{ .seconds = engine.durationSeconds() },
+    }) catch {};
+    const buffered = engine.bufferedFraction();
+    if (buffered < 1) suffix_w.print("  decoding {d:.0}%", .{buffered * 100}) catch {};
+    const suffix = suffix_w.buffered();
+
+    // Leave the last column free: writing into it makes some terminals wrap.
+    const room = (terminalWidth() orelse 80) -| (columns(prefix) + columns(suffix) + 1);
+    var fit_buf: [512]u8 = undefined;
+    std.debug.print("\r\x1b[2K{s}{s}{s}", .{ prefix, fit(&fit_buf, label, room), suffix });
+}
+
+/// "Artist – Title · Album" from the song's tags, or the file name if the
+/// song has no title tag.
+fn songLabel(buf: []u8, tags: mp3.id3.Tags, path: []const u8) []const u8 {
+    const title = tags.title orelse return std.fs.path.basename(path);
+    var w: Io.Writer = .fixed(buf);
+    if (tags.artist orelse tags.album_artist) |artist| w.print("{s} – ", .{artist}) catch {};
+    w.writeAll(title) catch {};
+    if (tags.album) |album| w.print(" · {s}", .{album}) catch {};
+    return w.buffered();
+}
+
+/// Copies `s` into `buf`, cut to at most `max_cols` terminal columns (ending
+/// in "…" if shortened), with control characters replaced.
+fn fit(buf: []u8, s: []const u8, max_cols: usize) []const u8 {
+    if (max_cols == 0) return "";
+    const shorten = columns(s) > max_cols;
+    const budget = if (shorten) max_cols - 1 else max_cols;
+    var n: usize = 0;
+    var cols: usize = 0;
+    var it = codepoints(s);
+    while (it.next()) |cp| {
+        const w = cpWidth(cp.value);
+        if (cols + w > budget or n + cp.bytes.len + "…".len > buf.len) break;
+        for (cp.bytes) |b| {
+            buf[n] = if (b < 0x20 or b == 0x7f) '?' else b;
+            n += 1;
+        }
+        cols += w;
+    }
+    if (shorten) {
+        @memcpy(buf[n..][0.."…".len], "…");
+        n += "…".len;
+    }
+    return buf[0..n];
+}
+
+/// Approximate display width of `s` in terminal columns.
+fn columns(s: []const u8) usize {
+    var cols: usize = 0;
+    var it = codepoints(s);
+    while (it.next()) |cp| cols += cpWidth(cp.value);
+    return cols;
+}
+
+/// Iterates codepoints of UTF-8 text; invalid UTF-8 is treated as Latin-1
+/// bytes so every byte still advances.
+const Codepoints = struct {
+    s: []const u8,
+    i: usize = 0,
+    valid: bool,
+
+    const Item = struct { value: u21, bytes: []const u8 };
+
+    fn next(it: *Codepoints) ?Item {
+        if (it.i >= it.s.len) return null;
+        const len: usize = if (it.valid) std.unicode.utf8ByteSequenceLength(it.s[it.i]) catch 1 else 1;
+        const bytes = it.s[it.i..][0..len];
+        it.i += len;
+        const value: u21 = if (len == 1) bytes[0] else std.unicode.utf8Decode(bytes) catch '?';
+        return .{ .value = value, .bytes = bytes };
+    }
+};
+
+fn codepoints(s: []const u8) Codepoints {
+    return .{ .s = s, .valid = std.unicode.utf8ValidateSlice(s) };
+}
+
+/// 2 for East Asian wide characters and emoji, 1 otherwise.
+fn cpWidth(cp: u21) usize {
+    const wide = [_][2]u21{
+        .{ 0x1100, 0x115f },  .{ 0x2e80, 0xa4cf },   .{ 0xac00, 0xd7a3 },
+        .{ 0xf900, 0xfaff },  .{ 0xfe30, 0xfe4f },   .{ 0xff00, 0xff60 },
+        .{ 0xffe0, 0xffe6 },  .{ 0x1f300, 0x1f64f }, .{ 0x1f900, 0x1f9ff },
+        .{ 0x20000, 0x3fffd },
+    };
+    for (wide) |r| if (cp >= r[0] and cp <= r[1]) return 2;
+    return 1;
+}
+
+extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+fn terminalWidth() ?usize {
+    var ws: std.posix.winsize = undefined;
+    if (ioctl(std.posix.STDERR_FILENO, std.posix.T.IOCGWINSZ, &ws) != 0 or ws.col == 0) return null;
+    return ws.col;
 }
 
 const Clock = struct {
@@ -330,4 +444,26 @@ const Terminal = struct {
 fn fail(comptime fmt: []const u8, args: anytype) error{Failed} {
     std.debug.print(fmt, args);
     return error.Failed;
+}
+
+const testing = std.testing;
+
+test "song label prefers tags and falls back to the file name" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("Björk – Hyperballad · Post", songLabel(&buf, .{ .title = "Hyperballad", .artist = "Björk", .album = "Post" }, "x.mp3"));
+    try testing.expectEqualStrings("Various – Intro", songLabel(&buf, .{ .title = "Intro", .album_artist = "Various" }, "x.mp3"));
+    try testing.expectEqualStrings("01 track.mp3", songLabel(&buf, .{ .artist = "No Title" }, "music/01 track.mp3"));
+}
+
+test "fit shortens to the column budget on codepoint boundaries" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("short", fit(&buf, "short", 10));
+    try testing.expectEqualStrings("Björk – H…", fit(&buf, "Björk – Hyperballad", 10));
+    // Wide characters take two columns each.
+    try testing.expectEqual(@as(usize, 6), columns("日本語"));
+    try testing.expectEqualStrings("日本…", fit(&buf, "日本語のうた", 5));
+    try testing.expectEqualStrings("", fit(&buf, "anything", 0));
+    try testing.expectEqualStrings("a?[2J", fit(&buf, "a\x1b[2J", 10));
+    // Invalid UTF-8 still advances byte by byte.
+    try testing.expectEqual(@as(usize, 3), columns("a\xffb"));
 }

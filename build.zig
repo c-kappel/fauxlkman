@@ -43,6 +43,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mp3_tests).step);
     const player_tests = b.addTest(.{ .root_module = player });
     test_step.dependOn(&b.addRunArtifact(player_tests).step);
+    const main_tests = b.addTest(.{ .root_module = exe.root_module });
+    test_step.dependOn(&b.addRunArtifact(main_tests).step);
     const creation_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/creation_tests.zig"),
         .target = target,

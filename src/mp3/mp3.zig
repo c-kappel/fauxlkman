@@ -12,6 +12,7 @@ const std = @import("std");
 pub const frame = @import("frame.zig");
 pub const stream = @import("stream.zig");
 pub const wav = @import("wav.zig");
+pub const id3 = @import("id3.zig");
 pub const Decoder = @import("decoder.zig").Decoder;
 pub const Encoder = @import("encoder.zig").Encoder;
 pub const EncodeOptions = @import("encoder.zig").Options;
@@ -137,4 +138,5 @@ test {
     _ = @import("decoder.zig");
     _ = @import("encoder.zig");
     _ = @import("tests.zig");
+    _ = @import("id3.zig");
 }
